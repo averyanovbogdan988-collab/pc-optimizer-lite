@@ -180,6 +180,22 @@ function Get-PairValue {
     return $null
 }
 
+# Готовит строку для подстановки в код, который собирается через
+# [scriptblock]::Create: без этого имя сети вида Bob's Wi-Fi ломает разбор,
+# а $ и ` внутри имени подставляют совсем другое значение.
+function ConvertTo-PsLiteral {
+    param($Value)
+    return "'" + ([string]$Value).Replace("'", "''") + "'"
+}
+
+# То же для списка строк: получается литерал вида @('a','b').
+function ConvertTo-PsArrayLiteral {
+    param($Values)
+    $items = @(@($Values) | ForEach-Object { ConvertTo-PsLiteral $_ })
+    if ($items.Count -eq 0) { return '@()' }
+    return '@(' + ($items -join ', ') + ')'
+}
+
 function Add-BackupEntry {
     param([hashtable]$Entry)
     $null = $script:Backup.Add($Entry)
@@ -438,16 +454,16 @@ function Check-AdvancedProps {
                         -Detail $r.Why -Advice 'Подходящего значения в списке драйвера нет - поменяйте вручную в свойствах адаптера.'
                     continue
                 }
-                $kw  = $p.RegistryKeyword
-                $reg = $target.reg
-                $oldReg = $p.RegistryValue
-                $name = $ad.Name
+                $kwLit   = ConvertTo-PsLiteral $p.RegistryKeyword
+                $regLit  = ConvertTo-PsLiteral $target.reg
+                $oldLit  = ConvertTo-PsArrayLiteral $p.RegistryValue
+                $nameLit = ConvertTo-PsLiteral $ad.Name
                 Add-Finding -Id $r.Id -Title "$($p.DisplayName) = '$cur'" -Status $r.Status `
                     -Detail $r.Why `
                     -FixLabel "Переключить '$($p.DisplayName)' на '$($target.disp)'" `
                     -FixAction ([scriptblock]::Create(@"
-                        Add-BackupEntry @{ kind = 'advprop'; adapter = '$name'; keyword = '$kw'; value = @('$($oldReg -join "','")') }
-                        Set-NetAdapterAdvancedProperty -Name '$name' -RegistryKeyword '$kw' -RegistryValue '$reg' -NoRestart -ErrorAction Stop
+                        Add-BackupEntry @{ kind = 'advprop'; adapter = $nameLit; keyword = $kwLit; value = $oldLit }
+                        Set-NetAdapterAdvancedProperty -Name $nameLit -RegistryKeyword $kwLit -RegistryValue $regLit -NoRestart -ErrorAction Stop
                         `$script:NeedAdapterRestart = `$true
 "@))
             } else {
@@ -465,14 +481,16 @@ function Check-AdvancedProps {
         if ($cur -match '2\.?4' -and $onFive) {
             $t = & $pick $bandProp '5'
             if ($t) {
-                $kw = $bandProp.RegistryKeyword; $reg = $t.reg; $name = $ad.Name
-                $oldReg = $bandProp.RegistryValue
+                $kwLit   = ConvertTo-PsLiteral $bandProp.RegistryKeyword
+                $regLit  = ConvertTo-PsLiteral $t.reg
+                $oldLit  = ConvertTo-PsArrayLiteral $bandProp.RegistryValue
+                $nameLit = ConvertTo-PsLiteral $ad.Name
                 Add-Finding -Id 'adv.band' -Title "Драйвер предпочитает 2.4 ГГц, хотя вы сидите на 5 ГГц" -Status 'WARN' `
                     -Detail 'При каждом переподключении ноутбук будет сползать на медленный и забитый 2.4 ГГц.' `
                     -FixLabel "Предпочитать 5 ГГц" `
                     -FixAction ([scriptblock]::Create(@"
-                        Add-BackupEntry @{ kind = 'advprop'; adapter = '$name'; keyword = '$kw'; value = @('$($oldReg -join "','")') }
-                        Set-NetAdapterAdvancedProperty -Name '$name' -RegistryKeyword '$kw' -RegistryValue '$reg' -NoRestart -ErrorAction Stop
+                        Add-BackupEntry @{ kind = 'advprop'; adapter = $nameLit; keyword = $kwLit; value = $oldLit }
+                        Set-NetAdapterAdvancedProperty -Name $nameLit -RegistryKeyword $kwLit -RegistryValue $regLit -NoRestart -ErrorAction Stop
                         `$script:NeedAdapterRestart = `$true
 "@))
             }
@@ -503,13 +521,16 @@ function Check-Services {
         if ($svc.Status -ne 'Running' -or $st -eq 'Disabled') {
             $problem = $true
             $n = $s.Name
+            $nLit  = ConvertTo-PsLiteral $n
+            $stLit = ConvertTo-PsLiteral $st
+            $sLit  = ConvertTo-PsLiteral $svc.Status
             Add-Finding -Id "svc.$n" -Title "Служба '$($s.Title)' ($n): $($svc.Status), запуск: $st" -Status 'BAD' `
                 -Detail 'Часто ломается "оптимизаторами", которые отключают службы пачками.' `
                 -FixLabel "Запустить службу $n" `
                 -FixAction ([scriptblock]::Create(@"
-                    Add-BackupEntry @{ kind = 'service'; name = '$n'; startMode = '$st'; status = '$($svc.Status)' }
-                    Set-Service -Name '$n' -StartupType Automatic -ErrorAction SilentlyContinue
-                    Start-Service -Name '$n' -ErrorAction Stop
+                    Add-BackupEntry @{ kind = 'service'; name = $nLit; startMode = $stLit; status = $sLit }
+                    Set-Service -Name $nLit -StartupType Automatic -ErrorAction SilentlyContinue
+                    Start-Service -Name $nLit -ErrorAction Stop
 "@))
         }
     }
@@ -674,16 +695,25 @@ function Check-Profiles {
     if ($autoOther.Count -gt 0) {
         $list = ($autoOther | Select-Object -First 12) -join ', '
         if ($autoOther.Count -gt 12) { $list += " ... (+$($autoOther.Count - 12))" }
-        $names = $autoOther -join '|~|'
-        Add-Finding -Id 'profiles.auto' -Title "Автоподключение включено у $($autoOther.Count) посторонних сетей" -Status 'WARN' `
-            -Detail "$list`nНоутбук может сам уйти с вашей сети на соседскую/гостевую/телефонную точку - для стрима это мгновенный разрыв." `
-            -FixLabel 'Оставить автоподключение только для текущей сети' `
-            -FixAction ([scriptblock]::Create(@"
-                foreach (`$n in ('$names' -split '\|~\|')) {
-                    Add-BackupEntry @{ kind = 'wlanProfileMode'; name = `$n; mode = 'auto' }
-                    Invoke-Native 'netsh.exe' @('wlan','set','profileparameter',"name=`$n",'connectionmode=manual') | Out-Null
-                }
+        if (-not $current) {
+            # Без активного подключения непонятно, какая сеть "своя": в $autoOther
+            # попадают все профили сразу, и починка выключила бы автоподключение
+            # к домашней сети тоже. Поэтому только сообщаем.
+            Add-Finding -Id 'profiles.auto' -Title "Сетей с автоподключением: $($autoOther.Count)" -Status 'INFO' `
+                -Detail "$list" `
+                -Advice 'Сейчас Wi-Fi ни к какой сети не подключён, поэтому не видно, какая сеть ваша. Подключитесь к своей сети и запустите проверку ещё раз - тогда смогу выключить автоподключение только у лишних.'
+        } else {
+            $namesLit = ConvertTo-PsArrayLiteral $autoOther
+            Add-Finding -Id 'profiles.auto' -Title "Автоподключение включено у $($autoOther.Count) посторонних сетей" -Status 'WARN' `
+                -Detail "$list`nНоутбук может сам уйти с вашей сети на соседскую/гостевую/телефонную точку - для стрима это мгновенный разрыв." `
+                -FixLabel 'Оставить автоподключение только для текущей сети' `
+                -FixAction ([scriptblock]::Create(@"
+                    foreach (`$n in $namesLit) {
+                        Add-BackupEntry @{ kind = 'wlanProfileMode'; name = `$n; mode = 'auto' }
+                        Invoke-Native 'netsh.exe' @('wlan','set','profileparameter',('name=' + `$n),'connectionmode=manual') | Out-Null
+                    }
 "@))
+        }
     } else {
         Add-Finding -Id 'profiles.auto' -Title 'Лишних сетей с автоподключением нет' -Status 'OK'
     }
@@ -696,12 +726,13 @@ function Check-Profiles {
 
     if ($currentManual -and $current) {
         $cn = $current
+        $cnLit = ConvertTo-PsLiteral $cn
         Add-Finding -Id 'profiles.current' -Title "У текущей сети '$cn' выключено автоподключение" -Status 'WARN' `
             -Detail 'После сна/перезагрузки Wi-Fi не поднимется сам.' `
             -FixLabel 'Включить автоподключение для текущей сети' `
             -FixAction ([scriptblock]::Create(@"
-                Add-BackupEntry @{ kind = 'wlanProfileMode'; name = '$cn'; mode = 'manual' }
-                Invoke-Native 'netsh.exe' @('wlan','set','profileparameter',"name=$cn",'connectionmode=auto') | Out-Null
+                Add-BackupEntry @{ kind = 'wlanProfileMode'; name = $cnLit; mode = 'manual' }
+                Invoke-Native 'netsh.exe' @('wlan','set','profileparameter',('name=' + $cnLit),'connectionmode=auto') | Out-Null
 "@))
     }
 }
@@ -716,9 +747,10 @@ function Check-MacRandomization {
         $ssid = $script:WlanInfo.Ssid
         $fix = $null
         if ($ssid) {
+            $ssidLit = ConvertTo-PsLiteral $ssid
             $fix = [scriptblock]::Create(@"
-                Add-BackupEntry @{ kind = 'wlanProfileRandom'; name = '$ssid'; value = 'enable' }
-                Invoke-Native 'netsh.exe' @('wlan','set','profileparameter',"name=$ssid",'randomization=disable') | Out-Null
+                Add-BackupEntry @{ kind = 'wlanProfileRandom'; name = $ssidLit; value = 'enable' }
+                Invoke-Native 'netsh.exe' @('wlan','set','profileparameter',('name=' + $ssidLit),'randomization=disable') | Out-Null
 "@)
         }
         Add-Finding -Id 'mac.random' -Title 'Включены случайные MAC-адреса' -Status 'WARN' `
@@ -820,8 +852,8 @@ function Check-Dns {
             -Detail "$detail`nКлассика после удалённого VPN/античита: сайты не открываются, хотя 'интернет есть'." `
             -FixLabel 'Сбросить DNS на выдаваемый роутером' `
             -FixAction ([scriptblock]::Create(@"
-                Add-BackupEntry @{ kind = 'dns'; ifIndex = $($ad.ifIndex); servers = @('$($servers -join "','")') }
-                Set-DnsClientServerAddress -InterfaceIndex $($ad.ifIndex) -ResetServerAddresses -ErrorAction Stop
+                Add-BackupEntry @{ kind = 'dns'; ifIndex = $([int]$ad.ifIndex); servers = $(ConvertTo-PsArrayLiteral $servers) }
+                Set-DnsClientServerAddress -InterfaceIndex $([int]$ad.ifIndex) -ResetServerAddresses -ErrorAction Stop
                 Invoke-Native 'ipconfig.exe' @('/flushdns') | Out-Null
 "@))
     } elseif ($dead.Count -gt 0) {
@@ -880,7 +912,7 @@ function Check-Proxy {
             -Detail 'Через него ходят обновления, магазин, часть лаунчеров.' `
             -FixLabel 'Сбросить системный прокси' `
             -FixAction ([scriptblock]::Create(@"
-                Add-BackupEntry @{ kind = 'winhttpProxy'; value = '$whProxy' }
+                Add-BackupEntry @{ kind = 'winhttpProxy'; value = $(ConvertTo-PsLiteral $whProxy) }
                 Invoke-Native 'netsh.exe' @('winhttp', 'reset', 'proxy') | Out-Null
 "@))
         $problem = $true
@@ -962,23 +994,25 @@ function Check-Metrics {
         $vi = Get-NetIPInterface -InterfaceIndex $v.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
         if (-not $vi) { continue }
         if ($v.Status -eq 'Up' -and [int]$vi.InterfaceMetric -le $wifiMetric) {
-            $hijackers += [pscustomobject]@{ Name = $v.Name; Desc = $v.InterfaceDescription; Index = $v.ifIndex; Metric = [int]$vi.InterfaceMetric }
+            $hijackers += [pscustomobject]@{ Name = $v.Name; Desc = $v.InterfaceDescription; Index = $v.ifIndex
+                                             Metric = [int]$vi.InterfaceMetric; Auto = [string]$vi.AutomaticMetric }
         }
     }
 
     if ($hijackers.Count -gt 0) {
         $d = ($hijackers | ForEach-Object { "$($_.Name) [$($_.Desc)] метрика $($_.Metric) <= Wi-Fi $wifiMetric" }) -join "`n"
-        $pairs = ($hijackers | ForEach-Object { "$($_.Index):$($_.Metric)" }) -join ','
+        # Метрику надо вернуть вместе с признаком "автоматическая": ручная метрика
+        # отключает автоподбор, и без этого откат оставляет адаптер закреплённым.
+        $listLit = '@(' + (($hijackers | ForEach-Object {
+            "@{ i = $([int]$_.Index); m = $([int]$_.Metric); a = $(ConvertTo-PsLiteral $_.Auto) }" }) -join ', ') + ')'
         $target = $wifiMetric + 50
         Add-Finding -Id 'route.hijack' -Title "Виртуальные адаптеры перехватывают трафик: $($hijackers.Count)" -Status 'BAD' `
             -Detail "$d`nWindows отправляет трафик в VPN/виртуальный адаптер вместо Wi-Fi. Симптом: интернет 'вроде есть', но игры и стрим не соединяются." `
             -FixLabel 'Понизить приоритет виртуальных адаптеров' `
             -FixAction ([scriptblock]::Create(@"
-                foreach (`$pair in ('$pairs' -split ',')) {
-                    `$parts = `$pair -split ':'
-                    `$idx = [int]`$parts[0]
-                    Add-BackupEntry @{ kind = 'metric'; ifIndex = `$idx; metric = [int]`$parts[1] }
-                    Set-NetIPInterface -InterfaceIndex `$idx -AddressFamily IPv4 -InterfaceMetric $target -ErrorAction SilentlyContinue
+                foreach (`$h in $listLit) {
+                    Add-BackupEntry @{ kind = 'metric'; ifIndex = `$h.i; metric = `$h.m; automatic = `$h.a }
+                    Set-NetIPInterface -InterfaceIndex `$h.i -AddressFamily IPv4 -InterfaceMetric $target -ErrorAction SilentlyContinue
                 }
 "@))
     } else {
@@ -1003,7 +1037,7 @@ function Check-TcpStack {
                 -Detail 'Типичный "твик из интернета". Режет реальную скорость закачки в разы, особенно на быстром канале.' `
                 -FixLabel 'Вернуть автонастройку TCP в Normal' `
                 -FixAction ([scriptblock]::Create(@"
-                    Add-BackupEntry @{ kind = 'tcpAutotune'; value = '$old' }
+                    Add-BackupEntry @{ kind = 'tcpAutotune'; value = $(ConvertTo-PsLiteral $old) }
                     Set-NetTCPSetting -SettingName Internet -AutoTuningLevelLocal Normal -ErrorAction Stop
 "@))
         } else {
@@ -1171,19 +1205,23 @@ function Check-Metered {
         if ($prof) { $cost = [string]$prof.GetConnectionCost().NetworkCostType }
     } catch {}
 
-    if ($cost -and $cost -ne 'Unrestricted') {
+    # Unknown означает "стоимость неизвестна", а не "лимитная": по нему нельзя
+    # ни ставить диагноз, ни потом корректно откатывать (fixed/variable).
+    if ($cost -and $cost -notmatch '^(Unrestricted|Unknown)$') {
         $ssid = $script:WlanInfo.Ssid
         $fix = $null
         if ($ssid) {
+            $ssidLit = ConvertTo-PsLiteral $ssid
+            $costLit = ConvertTo-PsLiteral $cost
             $fix = [scriptblock]::Create(@"
-                Add-BackupEntry @{ kind = 'wlanProfileCost'; name = '$ssid'; value = '$cost' }
-                Invoke-Native 'netsh.exe' @('wlan','set','profileparameter',"name=$ssid",'cost=unrestricted') | Out-Null
+                Add-BackupEntry @{ kind = 'wlanProfileCost'; name = $ssidLit; value = $costLit }
+                Invoke-Native 'netsh.exe' @('wlan','set','profileparameter',('name=' + $ssidLit),'cost=unrestricted') | Out-Null
 "@)
         }
         Add-Finding -Id 'metered' -Title "Сеть помечена как лимитная ($cost)" -Status 'WARN' `
             -Detail 'Windows и часть приложений режут себе трафик, откладывают загрузки и синхронизацию.' `
             -FixLabel 'Снять отметку лимитного подключения' -FixAction $fix
-    } elseif ($cost) {
+    } elseif ($cost -eq 'Unrestricted') {
         Add-Finding -Id 'metered' -Title 'Подключение не лимитное' -Status 'OK'
     }
 }
@@ -1211,12 +1249,13 @@ function Check-NetworkProfile {
     try {
         $blocked = @(Get-NetFirewallProfile -ErrorAction Stop | Where-Object { $_.DefaultOutboundAction -eq 'Block' })
         if ($blocked.Count -gt 0) {
-            $names = ($blocked | ForEach-Object { $_.Name }) -join ','
+            $names = ($blocked | ForEach-Object { $_.Name }) -join ', '
+            $namesLit = ConvertTo-PsArrayLiteral ($blocked | ForEach-Object { $_.Name })
             Add-Finding -Id 'fw.outbound' -Title "Брандмауэр блокирует исходящие по умолчанию: $names" -Status 'BAD' `
                 -Detail 'Всё, что не внесено в правила вручную, просто не выходит в интернет.' `
                 -FixLabel 'Разрешить исходящие соединения по умолчанию' `
                 -FixAction ([scriptblock]::Create(@"
-                    foreach (`$n in ('$names' -split ',')) {
+                    foreach (`$n in $namesLit) {
                         Add-BackupEntry @{ kind = 'fwOutbound'; name = `$n; value = 'Block' }
                         Set-NetFirewallProfile -Name `$n -DefaultOutboundAction Allow -ErrorAction SilentlyContinue
                     }
@@ -1251,14 +1290,14 @@ function Check-Bindings {
         $detail = ($killer | ForEach-Object { "$($_.DisplayName) [$($_.Name)] - $($_.Status)" }) -join "`n"
 
         if ($running.Count -gt 0) {
-            $names = ($running | ForEach-Object { $_.Name }) -join ','
+            $namesLit = ConvertTo-PsArrayLiteral ($running | ForEach-Object { $_.Name })
             Add-Finding -Id 'bindings.shapers' -Title "Работают службы приоритизации трафика: $($running.Count)" -Status 'WARN' `
                 -Detail "$detail`nТакие службы сами решают, какому приложению сколько дать, и иногда режут скорость. Но на адаптерах Killer часть из них участвует в выборе точки доступа и полосы, и остановка может сделать хуже - проверено на практике." `
                 -Advice 'Останавливать только вручную и с замером до и после: .\Wifi-Doctor.ps1 -Fix -Hard. Если после этого скорость упала - откатывайте: -Restore last' `
                 -HardOnly `
                 -FixLabel 'Остановить службы приоритизации трафика (только с -Hard)' `
                 -FixAction ([scriptblock]::Create(@"
-                    foreach (`$n in ('$names' -split ',')) {
+                    foreach (`$n in $namesLit) {
                         `$sm = ''
                         try { `$sm = [string](Get-CimInstance Win32_Service -Filter "Name='`$n'" -ErrorAction SilentlyContinue).StartMode } catch {}
                         Add-BackupEntry @{ kind = 'service'; name = `$n; startMode = `$sm; status = 'Running' }
@@ -1413,7 +1452,12 @@ function Restore-Backup {
                     Say "  профиль '$($e.name)': рандомизация MAC" 'Gray'
                 }
                 'wlanProfileCost' {
-                    $c = if ([string]$e.value -match 'Variable') { 'variable' } else { 'fixed' }
+                    $c = switch -Regex ([string]$e.value) {
+                        'Variable'     { 'variable' }
+                        'Fixed'        { 'fixed' }
+                        'Unrestricted' { 'unrestricted' }
+                        default        { 'default' }
+                    }
                     Invoke-Native 'netsh.exe' @('wlan', 'set', 'profileparameter', "name=$($e.name)", "cost=$c") | Out-Null
                     Say "  профиль '$($e.name)': лимитное подключение ($c)" 'Gray'
                 }
@@ -1426,8 +1470,13 @@ function Restore-Backup {
                     Say '  DNS-серверы' 'Gray'
                 }
                 'metric' {
-                    Set-NetIPInterface -InterfaceIndex $e.ifIndex -AddressFamily IPv4 -InterfaceMetric $e.metric -ErrorAction SilentlyContinue
-                    Say "  метрика интерфейса $($e.ifIndex)" 'Gray'
+                    if ([string]$e.automatic -eq 'Enabled') {
+                        Set-NetIPInterface -InterfaceIndex $e.ifIndex -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction SilentlyContinue
+                        Say "  метрика интерфейса $($e.ifIndex): снова автоматическая" 'Gray'
+                    } else {
+                        Set-NetIPInterface -InterfaceIndex $e.ifIndex -AddressFamily IPv4 -InterfaceMetric $e.metric -ErrorAction SilentlyContinue
+                        Say "  метрика интерфейса $($e.ifIndex)" 'Gray'
+                    }
                 }
                 'mtu' {
                     Set-NetIPInterface -InterfaceIndex $e.ifIndex -AddressFamily IPv4 -NlMtuBytes $e.value -ErrorAction SilentlyContinue
