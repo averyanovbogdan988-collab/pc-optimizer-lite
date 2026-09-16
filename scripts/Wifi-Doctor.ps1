@@ -183,9 +183,15 @@ function Get-PairValue {
 # Готовит строку для подстановки в код, который собирается через
 # [scriptblock]::Create: без этого имя сети вида Bob's Wi-Fi ломает разбор,
 # а $ и ` внутри имени подставляют совсем другое значение.
+# Кавычкой PowerShell считает не только ', но и типографские '  '  ‚  ‛ -
+# именно такую ставит iPhone в имени точки доступа ("Bob's iPhone").
 function ConvertTo-PsLiteral {
     param($Value)
-    return "'" + ([string]$Value).Replace("'", "''") + "'"
+    $s = [string]$Value
+    foreach ($q in @([char]0x27, [char]0x2018, [char]0x2019, [char]0x201A, [char]0x201B)) {
+        $s = $s.Replace([string]$q, [string]$q + [string]$q)
+    }
+    return "'" + $s + "'"
 }
 
 # То же для списка строк: получается литерал вида @('a','b').
@@ -838,10 +844,19 @@ function Check-Dns {
     $dead  = @()
     foreach ($s in $servers) {
         $ok = $false
-        try {
-            $r = Resolve-DnsName -Name 'www.microsoft.com' -Server $s -Type A -QuickTimeout -DnsOnly -ErrorAction Stop
-            if ($r) { $ok = $true }
-        } catch { $ok = $false }
+        # Две попытки: короткая и обычная. Одна потеря пакета на Wi-Fi не должна
+        # объявлять рабочий DNS мёртвым - за этим следует сброс настроек.
+        foreach ($quick in @($true, $false)) {
+            try {
+                $r = if ($quick) {
+                    Resolve-DnsName -Name 'www.microsoft.com' -Server $s -Type A -QuickTimeout -DnsOnly -ErrorAction Stop
+                } else {
+                    Resolve-DnsName -Name 'www.microsoft.com' -Server $s -Type A -DnsOnly -ErrorAction Stop
+                }
+                if ($r) { $ok = $true }
+            } catch { $ok = $false }
+            if ($ok) { break }
+        }
         if ($ok) { $alive += $s } else { $dead += $s }
     }
 
@@ -973,7 +988,13 @@ function Clear-HostsBlocking {
             $null = $out.Add($l)
         }
     }
-    Set-Content -LiteralPath $hostsPath -Value $out -Encoding ASCII -Force -ErrorAction Stop
+    # Писать надо той же кодировкой, какой Get-Content прочитал (ANSI в Windows
+    # PowerShell): -Encoding ASCII превращал кириллические комментарии в "?????".
+    try {
+        $item = Get-Item -LiteralPath $hostsPath -Force -ErrorAction Stop
+        if ($item.IsReadOnly) { $item.IsReadOnly = $false }
+    } catch {}
+    [IO.File]::WriteAllLines($hostsPath, [string[]]$out, [Text.Encoding]::Default)
     Invoke-Native 'ipconfig.exe' @('/flushdns') | Out-Null
 }
 
@@ -1078,21 +1099,35 @@ function Check-ReceivePath {
         if ($t.PSObject.Properties.Name -contains 'ScalingHeuristics') { $heur = [string]$t.ScalingHeuristics }
     } catch {}
     if (-not $heur -or $heur -eq 'Default') {
-        foreach ($l in (Invoke-Native 'netsh.exe' @('interface', 'tcp', 'show', 'heuristics'))) {
-            if ($l -match '(?i)(heuristics|эвристик)[^:]*:\s*(\S+)') { $heur = $matches[2] }
+        $hLines = @(Invoke-NativeOem 'netsh interface tcp show heuristics')
+        if ($hLines.Count -eq 0) { $hLines = @(Invoke-Native 'netsh.exe' @('interface', 'tcp', 'show', 'heuristics')) }
+        $hVal = $null
+        foreach ($l in $hLines) {
+            if ($l -match '(?i)(heuristics|эвристик)[^:]*:\s*(\S+)') { $hVal = $matches[2]; break }
         }
+        # Запасной разбор по форме значения: первая строка "что-то : enabled/disabled"
+        # в этом выводе - как раз эвристики. Работает при любом языке и кодировке.
+        if (-not $hVal) {
+            foreach ($l in $hLines) {
+                if ($l -match '(?i):\s*(enabled|disabled|включен\S*|отключен\S*)\s*$') { $hVal = $matches[1]; break }
+            }
+        }
+        if ($hVal) { $heur = $hVal }
     }
 
-    if ($heur -and $heur -match '(?i)enabled|включ') {
+    if ($heur -and $heur -match '(?i)^(enabled|включ)') {
         Add-Finding -Id 'rx.heuristics' -Title 'Включены эвристики масштабирования окна TCP' -Status 'BAD' `
             -Detail "Windows сама решает, что канал 'подозрительный', и зажимает окно приёма до 64 КБ.`nПри пинге под нагрузкой это режет загрузку до нескольких десятков Мбит/с, отдачу не трогая вовсе." `
             -FixLabel 'Отключить эвристики масштабирования окна' `
             -FixAction ([scriptblock]::Create(@"
-                Add-BackupEntry @{ kind = 'tcpHeuristics'; value = '$heur' }
+                Add-BackupEntry @{ kind = 'tcpHeuristics'; value = $(ConvertTo-PsLiteral $heur) }
                 Invoke-Native 'netsh.exe' @('interface', 'tcp', 'set', 'heuristics', 'disabled') | Out-Null
 "@))
-    } elseif ($heur) {
+    } elseif ($heur -and $heur -ne 'Default') {
         Add-Finding -Id 'rx.heuristics' -Title 'Эвристики масштабирования окна отключены' -Status 'OK'
+    } else {
+        Add-Finding -Id 'rx.heuristics' -Title 'Не удалось прочитать состояние эвристик масштабирования окна TCP' -Status 'INFO' `
+            -Advice 'Проверьте вручную: netsh interface tcp show heuristics. Если там enabled - выключите: netsh interface tcp set heuristics disabled'
     }
 
     # Автонастройку может переопределять групповая политика.
