@@ -113,6 +113,21 @@ function Test-Admin {
     } catch { return $false }
 }
 
+# PowerShell декодирует вывод внешних программ через [Console]::OutputEncoding.
+# Если она не совпадает с кодовой страницей консоли, русские метки netsh
+# превращаются в мусор и проверки их не находят. Выравниваем по факту.
+function Sync-ConsoleEncoding {
+    try {
+        $cp = 0
+        foreach ($l in (& cmd.exe /c chcp 2>&1)) {
+            if ("$l" -match '(\d{3,5})\s*$') { $cp = [int]$matches[1] }
+        }
+        if ($cp -gt 0 -and [Console]::OutputEncoding.CodePage -ne $cp) {
+            [Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding($cp)
+        }
+    } catch {}
+}
+
 function Invoke-Native {
     param([string]$File, [string[]]$Arguments = @())
     try {
@@ -381,7 +396,7 @@ function Check-AdvancedProps {
 
     $rules = @(
         @{ Id = 'adv.powersave'; Match = 'Power Save|Power Saving|Энергосбереж|PowerSave|Power Management'
-           Want = 'Max(imum)? Performance|Disabled|Отключ|Максимальная производ|No Power Sav|Highest Performance'
+           Want = 'Max(imum)? Performance|Disabled|Отключ|Выключ|Максимальная производ|No Power Sav|Highest Performance|No SMPS|Нет SMPS|^Нет$|^No$'
            Bad  = '.*'; Status = 'BAD'
            Why  = 'Энергосбережение внутри драйвера - вторая по частоте причина обрывов и пинга "лесенкой".' }
         @{ Id = 'adv.roaming'; Match = 'Roaming|Роуминг'
@@ -1193,9 +1208,27 @@ function Check-Bindings {
 
     $killer = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'Killer|Rivet|SmartByte|cFos|NetLimiter|Speedify|Bandwidth' })
     if ($killer.Count -gt 0) {
-        Add-Finding -Id 'bindings.shapers' -Title 'Найдены программы-приоритизаторы трафика' -Status 'WARN' `
-            -Detail (($killer | ForEach-Object { "$($_.DisplayName) - $($_.Status)" }) -join "`n") `
-            -Advice 'Killer Control Center, SmartByte, NetLimiter и подобные регулярно режут скорость сами. Проще удалить, оставив только драйвер адаптера.'
+        $running = @($killer | Where-Object { $_.Status -eq 'Running' })
+        $detail = ($killer | ForEach-Object { "$($_.DisplayName) [$($_.Name)] - $($_.Status)" }) -join "`n"
+
+        if ($running.Count -gt 0) {
+            $names = ($running | ForEach-Object { $_.Name }) -join ','
+            Add-Finding -Id 'bindings.shapers' -Title "Работают службы приоритизации трафика: $($running.Count)" -Status 'BAD' `
+                -Detail "$detail`nЭти службы сами решают, какому приложению сколько дать, и заметно режут скорость загрузки. Драйвера адаптера они не касаются - сеть после остановки продолжает работать." `
+                -FixLabel 'Остановить службы приоритизации трафика' `
+                -FixAction ([scriptblock]::Create(@"
+                    foreach (`$n in ('$names' -split ',')) {
+                        `$sm = ''
+                        try { `$sm = [string](Get-CimInstance Win32_Service -Filter "Name='`$n'" -ErrorAction SilentlyContinue).StartMode } catch {}
+                        Add-BackupEntry @{ kind = 'service'; name = `$n; startMode = `$sm; status = 'Running' }
+                        Set-Service -Name `$n -StartupType Manual -ErrorAction SilentlyContinue
+                        Stop-Service -Name `$n -Force -ErrorAction SilentlyContinue
+                    }
+"@)) `
+                -Advice 'Если скорость после этого вырастет - удалите Killer Control Center целиком, оставив только драйвер адаптера.'
+        } else {
+            Add-Finding -Id 'bindings.shapers' -Title 'Программы-приоритизаторы установлены, но не запущены' -Status 'INFO' -Detail $detail
+        }
     }
 }
 
@@ -1270,8 +1303,25 @@ function Restore-Backup {
     }
 
     Say-Head "Откат изменений из $Path"
-    $entries = @(Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json)
+    $data = ConvertFrom-Json (Get-Content -LiteralPath $Path -Raw -Encoding UTF8)
+
+    # Windows PowerShell 5.1 и PowerShell 7 по-разному отдают массив из ConvertFrom-Json,
+    # поэтому разворачиваем его сами, а не полагаемся на конвейер.
+    $flat = New-Object System.Collections.ArrayList
+    foreach ($lvl1 in @($data)) {
+        if ($lvl1 -is [object[]] -or $lvl1 -is [System.Collections.ArrayList]) {
+            foreach ($lvl2 in $lvl1) { $null = $flat.Add($lvl2) }
+        } else {
+            $null = $flat.Add($lvl1)
+        }
+    }
+    $entries = @($flat | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'kind' })
+    if ($entries.Count -eq 0) {
+        Say 'В файле бэкапа нет записей для отката.' 'Yellow'
+        return
+    }
     [array]::Reverse($entries)
+    Say ("Записей для отката: " + $entries.Count) 'Gray'
 
     foreach ($e in $entries) {
         try {
@@ -1291,14 +1341,17 @@ function Restore-Backup {
                     Say '  схема питания: энергосбережение Wi-Fi возвращено' 'Gray'
                 }
                 'service' {
-                    if ($e.startMode -and $e.startMode -ne 'Auto') {
-                        $map = @{ 'Manual' = 'Manual'; 'Disabled' = 'Disabled'; 'Auto' = 'Automatic' }
-                        if ($map.ContainsKey([string]$e.startMode)) {
-                            Set-Service -Name $e.name -StartupType $map[[string]$e.startMode] -ErrorAction SilentlyContinue
-                        }
+                    $map = @{ 'Manual' = 'Manual'; 'Disabled' = 'Disabled'; 'Auto' = 'Automatic'; 'Automatic' = 'Automatic' }
+                    $sm = [string]$e.startMode
+                    if ($map.ContainsKey($sm)) {
+                        Set-Service -Name $e.name -StartupType $map[$sm] -ErrorAction SilentlyContinue
                     }
-                    if ($e.status -ne 'Running') { Stop-Service -Name $e.name -Force -ErrorAction SilentlyContinue }
-                    Say "  служба $($e.name)" 'Gray'
+                    if ([string]$e.status -eq 'Running') {
+                        Start-Service -Name $e.name -ErrorAction SilentlyContinue
+                    } else {
+                        Stop-Service -Name $e.name -Force -ErrorAction SilentlyContinue
+                    }
+                    Say "  служба $($e.name) -> $sm / $($e.status)" 'Gray'
                 }
                 'adapterPm' {
                     $p = Get-NetAdapterPowerManagement -Name $e.name -ErrorAction Stop
@@ -1438,6 +1491,8 @@ function Main {
     Say '  Wi-Fi Doctor - pc-optimizer-lite' 'White'
     Say '  проверка настроек Wi-Fi и устранение помех' 'DarkGray'
     Say ("  " + (Get-Date -Format 'dd.MM.yyyy HH:mm:ss')) 'DarkGray'
+
+    Sync-ConsoleEncoding
 
     $admin = Test-Admin
     if (-not (Test-Path $script:AppDir)) {
