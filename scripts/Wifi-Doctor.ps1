@@ -977,6 +977,70 @@ function Check-TcpStack {
     } catch {}
 }
 
+function Check-ReceivePath {
+    Say-Head 'Приём данных (когда загрузка медленнее отдачи)'
+
+    Add-Finding -Id 'rx.hint' -Title 'Признак проблемы: скорость отдачи заметно выше скорости загрузки' -Status 'INFO' `
+        -Detail 'Отдачу ограничивает окно приёма сервера, а загрузку - окно приёма вашего компьютера. Поэтому зажатое окно, эвристики TCP и антивирусная проверка входящего трафика роняют только загрузку, оставляя отдачу целой.'
+
+    # Эвристики масштабирования окна: молча возвращают приём к 64 КБ.
+    $heur = $null
+    try {
+        $t = Get-NetTCPSetting -SettingName Internet -ErrorAction Stop
+        if ($t.PSObject.Properties.Name -contains 'ScalingHeuristics') { $heur = [string]$t.ScalingHeuristics }
+    } catch {}
+    if (-not $heur -or $heur -eq 'Default') {
+        foreach ($l in (Invoke-Native 'netsh.exe' @('interface', 'tcp', 'show', 'heuristics'))) {
+            if ($l -match '(?i)(heuristics|эвристик)[^:]*:\s*(\S+)') { $heur = $matches[2] }
+        }
+    }
+
+    if ($heur -and $heur -match '(?i)enabled|включ') {
+        Add-Finding -Id 'rx.heuristics' -Title 'Включены эвристики масштабирования окна TCP' -Status 'BAD' `
+            -Detail "Windows сама решает, что канал 'подозрительный', и зажимает окно приёма до 64 КБ.`nПри пинге под нагрузкой это режет загрузку до нескольких десятков Мбит/с, отдачу не трогая вовсе." `
+            -FixLabel 'Отключить эвристики масштабирования окна' `
+            -FixAction ([scriptblock]::Create(@"
+                Add-BackupEntry @{ kind = 'tcpHeuristics'; value = '$heur' }
+                Invoke-Native 'netsh.exe' @('interface', 'tcp', 'set', 'heuristics', 'disabled') | Out-Null
+"@))
+    } elseif ($heur) {
+        Add-Finding -Id 'rx.heuristics' -Title 'Эвристики масштабирования окна отключены' -Status 'OK'
+    }
+
+    # Автонастройку может переопределять групповая политика.
+    try {
+        $t2 = Get-NetTCPSetting -SettingName Internet -ErrorAction Stop
+        if ([string]$t2.AutoTuningLevelEffective -eq 'GroupPolicy' -and
+            [string]$t2.AutoTuningLevelGroupPolicy -notmatch 'Normal|NotConfigured') {
+            Add-Finding -Id 'rx.gpo' -Title "Автонастройку окна TCP переопределяет групповая политика: $($t2.AutoTuningLevelGroupPolicy)" -Status 'BAD' `
+                -Detail 'Значение из политики сильнее локального, поэтому обычная правка автонастройки не подействует.' `
+                -Advice 'Убрать политику: HKLM\SOFTWARE\Policies\Microsoft\Windows\Tcpip\Parameters, параметр EnableWsd/TcpAutotuning. Автоматически не трогаю - политику мог поставить администратор.'
+        }
+    } catch {}
+
+    # Проверка входящего трафика сторонним антивирусом.
+    try {
+        $av = @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop |
+                Where-Object { $_.displayName -notmatch 'Windows Defender|Microsoft Defender' })
+        if ($av.Count -gt 0) {
+            Add-Finding -Id 'rx.av' -Title "Сторонний антивирус: $(($av | ForEach-Object { $_.displayName }) -join ', ')" -Status 'WARN' `
+                -Detail 'Проверка HTTPS/веб-трафика прогоняет через себя всё входящее и часто срезает загрузку в 2-3 раза, не трогая отдачу.' `
+                -Advice 'Временно выключите в антивирусе проверку веб-трафика (HTTPS scanning / Web Shield) и перезамерьте скорость. Если разница есть - держите её выключенной или добавьте исключения.'
+        }
+    } catch {}
+
+    # Приёмные буферы адаптера.
+    $ad = $script:Wifi
+    if ($ad) {
+        $rxb = @(Get-NetAdapterAdvancedProperty -Name $ad.Name -ErrorAction SilentlyContinue |
+                 Where-Object { $_.DisplayName -match 'Receive Buffers|Приемные буферы|Приёмные буферы' })
+        foreach ($p in $rxb) {
+            Add-Finding -Id 'rx.buffers' -Title "$($p.DisplayName) = $($p.DisplayValue)" -Status 'INFO' `
+                -Advice 'Если загрузка проседает рывками - поднимите это значение до максимума в свойствах адаптера.'
+        }
+    }
+}
+
 function Check-Mtu {
     Say-Head 'MTU'
     $ad = $script:Wifi
@@ -1280,6 +1344,11 @@ function Restore-Backup {
                     Set-NetTCPSetting -SettingName Internet -AutoTuningLevelLocal $e.value -ErrorAction SilentlyContinue
                     Say '  автонастройка TCP' 'Gray'
                 }
+                'tcpHeuristics' {
+                    $h = if ([string]$e.value -match '(?i)enabled|включ') { 'enabled' } else { 'disabled' }
+                    Invoke-Native 'netsh.exe' @('interface', 'tcp', 'set', 'heuristics', $h) | Out-Null
+                    Say "  эвристики масштабирования окна TCP: $h" 'Gray'
+                }
                 'rss' {
                     Set-NetOffloadGlobalSetting -ReceiveSideScaling Disabled -ErrorAction SilentlyContinue
                     Say '  RSS' 'Gray'
@@ -1412,6 +1481,7 @@ function Main {
     Check-HostsFile
     Check-Metrics
     Check-TcpStack
+    Check-ReceivePath
     Check-Mtu
     Check-Qos
     Check-DeliveryOptimization
