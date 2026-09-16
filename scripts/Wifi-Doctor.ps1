@@ -1252,9 +1252,11 @@ function Check-Bindings {
 
         if ($running.Count -gt 0) {
             $names = ($running | ForEach-Object { $_.Name }) -join ','
-            Add-Finding -Id 'bindings.shapers' -Title "Работают службы приоритизации трафика: $($running.Count)" -Status 'BAD' `
-                -Detail "$detail`nЭти службы сами решают, какому приложению сколько дать, и заметно режут скорость загрузки. Драйвера адаптера они не касаются - сеть после остановки продолжает работать." `
-                -FixLabel 'Остановить службы приоритизации трафика' `
+            Add-Finding -Id 'bindings.shapers' -Title "Работают службы приоритизации трафика: $($running.Count)" -Status 'WARN' `
+                -Detail "$detail`nТакие службы сами решают, какому приложению сколько дать, и иногда режут скорость. Но на адаптерах Killer часть из них участвует в выборе точки доступа и полосы, и остановка может сделать хуже - проверено на практике." `
+                -Advice 'Останавливать только вручную и с замером до и после: .\Wifi-Doctor.ps1 -Fix -Hard. Если после этого скорость упала - откатывайте: -Restore last' `
+                -HardOnly `
+                -FixLabel 'Остановить службы приоритизации трафика (только с -Hard)' `
                 -FixAction ([scriptblock]::Create(@"
                     foreach (`$n in ('$names' -split ',')) {
                         `$sm = ''
@@ -1263,8 +1265,7 @@ function Check-Bindings {
                         Set-Service -Name `$n -StartupType Manual -ErrorAction SilentlyContinue
                         Stop-Service -Name `$n -Force -ErrorAction SilentlyContinue
                     }
-"@)) `
-                -Advice 'Если скорость после этого вырастет - удалите Killer Control Center целиком, оставив только драйвер адаптера.'
+"@))
         } else {
             Add-Finding -Id 'bindings.shapers' -Title 'Программы-приоритизаторы установлены, но не запущены' -Status 'INFO' -Detail $detail
         }
