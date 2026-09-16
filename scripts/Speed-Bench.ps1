@@ -157,7 +157,7 @@ function Get-Latency {
 }
 
 function Get-WifiSnapshot {
-    $out = [ordered]@{ Ssid = ''; Channel = ''; Signal = ''; Radio = ''; LinkMbps = '' }
+    $out = [ordered]@{ Ssid = ''; Channel = ''; Signal = ''; Radio = ''; LinkMbps = ''; RxRate = ''; TxRate = '' }
     try {
         $ad = Get-NetAdapter -ErrorAction SilentlyContinue |
               Where-Object { $_.Status -eq 'Up' -and ($_.PhysicalMediaType -match '802\.11|Wireless' -or $_.InterfaceDescription -match 'Wi-?Fi|Wireless|WLAN') } |
@@ -181,8 +181,36 @@ function Get-WifiSnapshot {
     # канал - первое целочисленное поле вывода, не зависит от языка
     $ints = @()
     foreach ($l in $lines) { if ($l -match '^\s*[^:]{1,60}:\s*(\d{1,6})\s*$') { $ints += $matches[1] } }
+    # в выводе show interfaces целыми числами идут ровно три поля,
+    # в фиксированном порядке: канал, скорость приёма, скорость передачи
     if ($ints.Count -ge 1) { $out.Channel = $ints[0] }
+    if ($ints.Count -ge 2) { $out.RxRate  = $ints[1] }
+    if ($ints.Count -ge 3) { $out.TxRate  = $ints[2] }
     return $out
+}
+
+# Снимает состояние радио несколько раз подряд - запускается параллельно
+# с загрузкой, чтобы увидеть скорости приёма и передачи именно под нагрузкой.
+$script:RadioSampler = {
+    param([int]$Samples)
+    $acc = @()
+    for ($i = 0; $i -lt $Samples; $i++) {
+        $f = $null
+        try {
+            $f = [IO.Path]::GetTempFileName()
+            & cmd.exe /d /c "netsh wlan show interfaces > `"$f`" 2>&1" | Out-Null
+            $lines = @(Get-Content -LiteralPath $f -Encoding Oem -ErrorAction SilentlyContinue)
+            $ints = @()
+            $sig = ''
+            foreach ($l in $lines) {
+                if ($l -match '^\s*[^:]{1,60}:\s*(\d{1,6})\s*$') { $ints += $matches[1] }
+                if ($l -match ':\s*(\d{1,3})\s*%\s*$') { $sig = $matches[1] }
+            }
+            if ($ints.Count -ge 3) { $acc += ("{0};{1};{2}" -f $ints[1], $ints[2], $sig) }
+        } catch {} finally { if ($f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue } }
+        Start-Sleep -Milliseconds 700
+    }
+    return ($acc -join '|')
 }
 
 function Show-Comparison {
@@ -283,6 +311,10 @@ function Main {
         }).AddArgument('1.1.1.1')
         $pingHandle = $pingJob.BeginInvoke()
 
+        $radioJob = [powershell]::Create()
+        $null = $radioJob.AddScript($script:RadioSampler).AddArgument(8)
+        $radioHandle = $radioJob.BeginInvoke()
+
         $many = Invoke-Parallel -Script $script:Worker -Arguments @(($script:DownUrl -f $bytes), 60) -Count $Streams
         $manyMbps = Get-Mbps $many.Bytes $many.Seconds
         Say ("  загрузка $Streams потока: {0} Мбит/с" -f $manyMbps) 'White'
@@ -292,6 +324,24 @@ function Main {
         try { $pingLoaded = [int](@($pingJob.EndInvoke($pingHandle)) | Select-Object -Last 1) } catch {}
         $pingJob.Dispose()
         Say ("  пинг под нагрузкой: {0} мс" -f $pingLoaded) 'Gray'
+
+        # состояние радио именно под нагрузкой - ключевое показание
+        $rxLoad = 0; $txLoad = 0; $sigLoad = 0
+        try {
+            $raw = [string](@($radioJob.EndInvoke($radioHandle)) | Select-Object -Last 1)
+            foreach ($chunk in ($raw -split '\|')) {
+                $parts = $chunk -split ';'
+                if ($parts.Count -ge 2) {
+                    if ([int]$parts[0] -gt $rxLoad) { $rxLoad = [int]$parts[0] }
+                    if ([int]$parts[1] -gt $txLoad) { $txLoad = [int]$parts[1] }
+                    if ($parts.Count -ge 3 -and $parts[2] -and [int]$parts[2] -gt $sigLoad) { $sigLoad = [int]$parts[2] }
+                }
+            }
+        } catch {}
+        $radioJob.Dispose()
+        if ($rxLoad -gt 0 -or $txLoad -gt 0) {
+            Say ("  радио под нагрузкой: приём $rxLoad / передача $txLoad Мбит/с, сигнал $sigLoad%") 'Gray'
+        }
 
         $upMbps = 0
         if (-not $NoUpload) {
@@ -309,6 +359,8 @@ function Main {
             UpMbps         = $upMbps
             PingIdleMs     = $(if ($null -ne $pingIdle) { $pingIdle } else { 0 })
             PingLoadedMs   = $pingLoaded
+            RxRateLoad     = $rxLoad
+            TxRateLoad     = $txLoad
             Ssid           = $wifi.Ssid
             Channel        = $wifi.Channel
             Signal         = $wifi.Signal
@@ -329,6 +381,23 @@ function Main {
     $um = [math]::Round((@($results.UpMbps) | Measure-Object -Maximum).Maximum, 1)
     Say ("  лучшая загрузка: $ds Мбит/с в один поток, $dm Мбит/с в $Streams потока") 'White'
     Say ("  лучшая отдача:   $um Мбит/с") 'White'
+
+    $rxAll = @($results | ForEach-Object { [int]$_.RxRateLoad } | Where-Object { $_ -gt 0 })
+    $txAll = @($results | ForEach-Object { [int]$_.TxRateLoad } | Where-Object { $_ -gt 0 })
+    if ($rxAll.Count -gt 0 -and $txAll.Count -gt 0) {
+        $rxMax = ($rxAll | Measure-Object -Maximum).Maximum
+        $txMax = ($txAll | Measure-Object -Maximum).Maximum
+        Say ("  радио под нагрузкой: приём $rxMax / передача $txMax Мбит/с") 'White'
+        Say ''
+        if ($rxMax -lt ($txMax * 0.6)) {
+            Say '  Скорость приёма радио заметно ниже скорости передачи:' 'Yellow'
+            Say '  дело в самом радио - энергосбережение приёмных цепей, ширина канала, помехи.' 'Yellow'
+        } elseif ($dm -gt 0 -and $rxMax -gt ($dm * 2.5)) {
+            Say '  Радио принимает быстро, а реальная загрузка втрое ниже:' 'Yellow'
+            Say '  упирается не в радио, а в приёмный тракт Windows (RSC, фильтры, антивирус)' 'Yellow'
+            Say '  или в очередь на точке доступа.' 'Yellow'
+        }
+    }
 
     if ($ds -gt 0 -and $dm -gt ($ds * 2.5)) {
         Say ''
