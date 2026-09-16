@@ -205,6 +205,10 @@ function ConvertTo-PsArrayLiteral {
 function Add-BackupEntry {
     param([hashtable]$Entry)
     $null = $script:Backup.Add($Entry)
+    # Сбрасываем файл сразу: если прогон прервут (Ctrl-C, зависший драйвер,
+    # выключение питания), уже сделанное изменение всё равно можно откатить.
+    # Файл на запуск один (имя из $script:Stamp), поэтому просто перезаписываем.
+    try { $null = Save-Backup } catch {}
 }
 
 function Set-RegValueBacked {
@@ -1072,18 +1076,9 @@ function Check-TcpStack {
         Add-Finding -Id 'tcp' -Title 'Не удалось прочитать параметры TCP' -Status 'INFO'
     }
 
-    try {
-        $off = Get-NetOffloadGlobalSetting -ErrorAction Stop
-        if ($off.ReceiveSideScaling -eq 'Disabled') {
-            Add-Finding -Id 'tcp.rss' -Title 'Отключён RSS (масштабирование на стороне приёма)' -Status 'WARN' `
-                -Detail 'Вся обработка сети падает на одно ядро - на стриме это лишние фризы.' `
-                -FixLabel 'Включить RSS' `
-                -FixAction {
-                    Add-BackupEntry @{ kind = 'rss'; value = 'Disabled' }
-                    Set-NetOffloadGlobalSetting -ReceiveSideScaling Enabled -ErrorAction Stop
-                }
-        }
-    } catch {}
+    # RSS сознательно не проверяем: Microsoft прямо пишет, что беспроводные
+    # адаптеры RSS не поддерживают, поэтому его состояние для Wi-Fi ничего
+    # не значит и находка по нему только вводила бы в заблуждение.
 }
 
 function Check-ReceivePath {
@@ -1151,6 +1146,33 @@ function Check-ReceivePath {
                 -Advice 'Временно выключите в антивирусе проверку веб-трафика (HTTPS scanning / Web Shield) и перезамерьте скорость. Если разница есть - держите её выключенной или добавьте исключения.'
         }
     } catch {}
+
+    # RSC - объединение сегментов на приёме. Документированная причина того,
+    # что медленно только в направлении "точка доступа -> компьютер".
+    $ad0 = $script:Wifi
+    if ($ad0) {
+        try {
+            $rsc = Get-NetAdapterRsc -Name $ad0.Name -ErrorAction Stop
+            $on = @()
+            if ($rsc.IPv4Enabled) { $on += 'IPv4' }
+            if ($rsc.IPv6Enabled) { $on += 'IPv6' }
+            if ($on.Count -gt 0) {
+                $nameLit = ConvertTo-PsLiteral $ad0.Name
+                Add-Finding -Id 'rx.rsc' -Title "Включено объединение сегментов на приёме, RSC ($($on -join ', '))" -Status 'BAD' `
+                    -Detail "Разбор Cisco и Intel описывает это так: медленно только в направлении точка доступа -> компьютер, отдача с компьютера в порядке.`nЕсть случай на адаптере Killer 6E, где отключение RSC подняло загрузку с единиц мегабит до сотен." `
+                    -FixLabel 'Отключить RSC на Wi-Fi адаптере' `
+                    -FixAction ([scriptblock]::Create(@"
+                        Add-BackupEntry @{ kind = 'rsc'; name = $nameLit; ipv4 = `$$($rsc.IPv4Enabled); ipv6 = `$$($rsc.IPv6Enabled) }
+                        Disable-NetAdapterRsc -Name $nameLit -ErrorAction Stop
+"@))
+            } else {
+                Add-Finding -Id 'rx.rsc' -Title 'RSC на Wi-Fi адаптере отключено' -Status 'OK'
+            }
+        } catch {
+            Add-Finding -Id 'rx.rsc' -Title 'Не удалось прочитать состояние RSC' -Status 'INFO' `
+                -Advice 'Проверьте вручную: Get-NetAdapterRsc. Если включено - отключите: Disable-NetAdapterRsc -Name "*"'
+        }
+    }
 
     # Приёмные буферы адаптера.
     $ad = $script:Wifi
@@ -1306,7 +1328,8 @@ function Check-Bindings {
     $ad = $script:Wifi
     if (-not $ad) { return }
     $known = @('ms_msclient', 'ms_pacer', 'ms_server', 'ms_tcpip6', 'ms_tcpip', 'ms_lltdio', 'ms_rspndr',
-               'ms_lldp', 'ms_implat', 'ms_ndisuio', 'ms_wfplwfs', 'ms_netbios', 'ms_netbt', 'ms_bridge')
+               'ms_lldp', 'ms_implat', 'ms_ndisuio', 'ms_wfplwfs', 'ms_wfplwf', 'ms_ndiscap',
+               'ms_netbios', 'ms_netbt', 'ms_bridge')
     try {
         $extra = @(Get-NetAdapterBinding -Name $ad.Name -ErrorAction Stop |
                    Where-Object { $_.Enabled -and ($known -notcontains $_.ComponentID) })
@@ -1520,6 +1543,12 @@ function Restore-Backup {
                 'tcpAutotune' {
                     Set-NetTCPSetting -SettingName Internet -AutoTuningLevelLocal $e.value -ErrorAction SilentlyContinue
                     Say '  автонастройка TCP' 'Gray'
+                }
+                'rsc' {
+                    if ($e.ipv4 -or $e.ipv6) {
+                        Enable-NetAdapterRsc -Name $e.name -ErrorAction SilentlyContinue
+                        Say "  RSC возвращено на $($e.name)" 'Gray'
+                    }
                 }
                 'tcpHeuristics' {
                     $h = if ([string]$e.value -match '(?i)enabled|включ') { 'enabled' } else { 'disabled' }
