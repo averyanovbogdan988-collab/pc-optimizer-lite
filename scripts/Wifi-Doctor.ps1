@@ -128,6 +128,23 @@ function Sync-ConsoleEncoding {
     } catch {}
 }
 
+# Надёжное чтение вывода консольных программ: перенаправляем в файл и читаем
+# его в OEM-кодировке. Это не зависит от [Console]::OutputEncoding, из-за
+# которой русские метки netsh могут прийти нечитаемыми.
+function Invoke-NativeOem {
+    param([string]$CommandLine)
+    $f = $null
+    try {
+        $f = [IO.Path]::GetTempFileName()
+        & cmd.exe /d /c "$CommandLine > `"$f`" 2>&1" | Out-Null
+        return @(Get-Content -LiteralPath $f -Encoding Oem -ErrorAction SilentlyContinue)
+    } catch {
+        return @()
+    } finally {
+        if ($f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Invoke-Native {
     param([string]$File, [string[]]$Arguments = @())
     try {
@@ -503,7 +520,10 @@ function Check-Services {
 
 function Check-WlanState {
     Say-Head 'Текущее подключение'
-    $lines = Invoke-Native 'netsh.exe' @('wlan', 'show', 'interfaces')
+    $lines = Invoke-NativeOem 'netsh wlan show interfaces'
+    if (@($lines | Where-Object { $_ -match '^\s*SSID\s*:' }).Count -eq 0) {
+        $lines = Invoke-Native 'netsh.exe' @('wlan', 'show', 'interfaces')
+    }
     $pairs = ConvertFrom-NetshPairs $lines
 
     $ssid   = $null
@@ -516,6 +536,24 @@ function Check-WlanState {
 
     $signal = $null
     foreach ($l in $lines) { if ($l -match ':\s*(\d{1,3})\s*%\s*$') { $signal = [int]$matches[1]; break } }
+
+    # Запасной разбор по форме значения - работает при любом языке Windows
+    # и даже если метки пришли нечитаемыми.
+    if (-not $radio) {
+        foreach ($l in $lines) { if ($l -match ':\s*(802\.11\S*)\s*$') { $radio = $matches[1]; break } }
+    }
+    if (-not $auth) {
+        foreach ($l in $lines) { if ($l -match ':\s*((?:WPA|WEP|RSNA)\S*.*?)\s*$') { $auth = $matches[1]; break } }
+    }
+    # В выводе show interfaces целыми числами идут ровно три поля,
+    # в фиксированном порядке: канал, скорость приёма, скорость передачи.
+    $ints = @()
+    foreach ($l in $lines) {
+        if ($l -match '^\s*[^:]{1,60}:\s*(\d{1,6})\s*$') { $ints += $matches[1] }
+    }
+    if (-not $chan -and $ints.Count -ge 1) { $chan = $ints[0] }
+    if (-not $rx   -and $ints.Count -ge 2) { $rx   = $ints[1] }
+    if (-not $tx   -and $ints.Count -ge 3) { $tx   = $ints[2] }
 
     $script:WlanInfo = @{ Ssid = $ssid; Channel = $chan; Signal = $signal; Radio = $radio }
     if ($chan -match '^\d+$') { $script:WlanInfo.Band5 = ([int]$chan -gt 14) }
@@ -560,7 +598,8 @@ function Check-WlanState {
     }
 
     # Загруженность эфира
-    $nets = Invoke-Native 'netsh.exe' @('wlan', 'show', 'networks', 'mode=bssid')
+    $nets = Invoke-NativeOem 'netsh wlan show networks mode=bssid'
+    if ($nets.Count -eq 0) { $nets = Invoke-Native 'netsh.exe' @('wlan', 'show', 'networks', 'mode=bssid') }
     $ssidCount = @($nets | Where-Object { $_ -match '^\s*SSID\s+\d+\s*:' }).Count
     if ($ssidCount -gt 0) {
         $sameChan = 0
